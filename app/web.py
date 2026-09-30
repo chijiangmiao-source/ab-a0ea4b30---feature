@@ -1,11 +1,16 @@
 """HTTP 入口（仅标准库）。
 
 路由:
-  GET  /                     浏览器页面
-  GET  /healthz              健康检查 -> {"status":"ok"}
-  POST /api/audits           提交审计
+  GET  /                                       浏览器页面
+  GET  /healthz                                健康检查 -> {"status":"ok"}
+  POST /api/audits                             提交审计
        201 首次冻结; 200 同载荷重放; 409 同号不同载荷; 400 载荷非法
-  GET  /api/audits/<id>      按审计编号读取冻结结果; 404 不存在
+  GET  /api/audits/<id>                        按审计编号读取冻结结果; 404 不存在
+  POST /api/envelopes                          在可行审计上创建冻结运行包线
+       201 首次冻结; 200 同载荷重放; 409 同号改来源/系数;
+       400 来源不存在/不可行/载荷非法; 422 超过受理规模
+  GET  /api/envelopes/<id>                     按编号读取冻结包线; 404
+  POST /api/envelopes/<id>/query               有理坐标查询; 404 包线不存在
 """
 
 from __future__ import annotations
@@ -15,8 +20,9 @@ import os
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
+from .envelope import ProjectionScaleError
 from .models import PayloadError
-from .service import AuditService, IdConflictError
+from .service import AuditService, EnvelopeConflictError, IdConflictError
 from .storage import AuditStore
 
 _DATA_DIR = os.environ.get("AUDIT_DATA_DIR", "/data")
@@ -75,34 +81,66 @@ class Handler(BaseHTTPRequestHandler):
                 )
             else:
                 self._send_json(HTTPStatus.OK, {"replayed": True, **record})
+        elif path == "/api/envelopes":
+            self._send_json(HTTPStatus.METHOD_NOT_ALLOWED,
+                            {"error": "method_not_allowed"})
+        elif path.startswith("/api/envelopes/"):
+            tail = path[len("/api/envelopes/"):]
+            if not tail or "/" in tail:
+                # 仅允许 /api/envelopes/<id> 形式的 GET
+                self._send_json(HTTPStatus.NOT_FOUND, {"error": "not_found"})
+                return
+            record = self.service.fetch_envelope(tail)
+            if record is None:
+                self._send_json(
+                    HTTPStatus.NOT_FOUND,
+                    {"error": "not_found", "envelope_id": tail},
+                )
+            else:
+                self._send_json(HTTPStatus.OK, {"replayed": True, **record})
         else:
             self._send_json(HTTPStatus.NOT_FOUND, {"error": "not_found"})
 
     def do_POST(self):
         path = self.path.split("?", 1)[0]
-        if path != "/api/audits":
+        if path == "/api/audits":
+            self._post_audit()
+        elif path == "/api/envelopes":
+            self._post_envelope()
+        elif path.startswith("/api/envelopes/") and path.endswith("/query"):
+            ident = path[len("/api/envelopes/"):-len("/query")]
+            if not ident or "/" in ident:
+                self._send_json(HTTPStatus.NOT_FOUND, {"error": "not_found"})
+                return
+            self._post_query(ident)
+        else:
             self._send_json(HTTPStatus.NOT_FOUND, {"error": "not_found"})
-            return
+
+    def _read_json_body(self):
+        """读取并解析 JSON；返回 (obj, error_response)，解析失败时后者非 None。"""
         try:
             length = int(self.headers.get("Content-Length", "0"))
         except ValueError:
             length = -1
         if length <= 0 or length > _MAX_BODY:
-            self._send_json(
+            return None, (
                 HTTPStatus.BAD_REQUEST,
                 {"error": "invalid_payload", "detail": "请求体缺失或过大"},
             )
-            return
         raw = self.rfile.read(length)
         try:
-            payload = json.loads(raw.decode("utf-8"))
+            return json.loads(raw.decode("utf-8")), None
         except (UnicodeDecodeError, json.JSONDecodeError) as exc:
-            self._send_json(
+            return None, (
                 HTTPStatus.BAD_REQUEST,
                 {"error": "invalid_payload", "detail": f"JSON 解析失败: {exc}"},
             )
-            return
 
+    def _post_audit(self):
+        payload, err = self._read_json_body()
+        if err is not None:
+            self._send_json(err[0], err[1])
+            return
         try:
             record, replayed = self.service.audit(payload)
         except PayloadError as exc:
@@ -129,6 +167,65 @@ class Handler(BaseHTTPRequestHandler):
             HTTPStatus.OK if replayed else HTTPStatus.CREATED,
             {"replayed": replayed, **record},
         )
+
+    def _post_envelope(self):
+        payload, err = self._read_json_body()
+        if err is not None:
+            self._send_json(err[0], err[1])
+            return
+        try:
+            record, replayed = self.service.create_envelope(payload)
+        except PayloadError as exc:
+            self._send_json(
+                HTTPStatus.BAD_REQUEST,
+                {"error": "invalid_payload", "detail": str(exc)},
+            )
+            return
+        except ProjectionScaleError as exc:
+            self._send_json(
+                HTTPStatus.UNPROCESSABLE_ENTITY,
+                {"error": "scale_exceeded", "detail": str(exc)},
+            )
+            return
+        except EnvelopeConflictError as exc:
+            self._send_json(
+                HTTPStatus.CONFLICT,
+                {
+                    "error": "envelope_id_conflict",
+                    "detail": "同一包线编号已绑定不同来源或扰动系数；已冻结包线保持不变",
+                    "envelope_id": exc.existing["envelope_id"],
+                    "existing_fingerprint": exc.existing["fingerprint"],
+                    "existing_created_at": exc.existing["created_at"],
+                    "new_fingerprint": exc.new_fingerprint,
+                },
+            )
+            return
+
+        self._send_json(
+            HTTPStatus.OK if replayed else HTTPStatus.CREATED,
+            {"replayed": replayed, **record},
+        )
+
+    def _post_query(self, envelope_id: str):
+        payload, err = self._read_json_body()
+        if err is not None:
+            self._send_json(err[0], err[1])
+            return
+        try:
+            answer = self.service.query_point(envelope_id, payload)
+        except LookupError:
+            self._send_json(
+                HTTPStatus.NOT_FOUND,
+                {"error": "not_found", "envelope_id": envelope_id},
+            )
+            return
+        except PayloadError as exc:
+            self._send_json(
+                HTTPStatus.BAD_REQUEST,
+                {"error": "invalid_payload", "detail": str(exc)},
+            )
+            return
+        self._send_json(HTTPStatus.OK, answer)
 
 
 def make_server(host: str = _HOST, port: int = _PORT, data_dir: str = _DATA_DIR):

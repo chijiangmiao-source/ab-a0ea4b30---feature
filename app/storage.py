@@ -24,6 +24,13 @@ class IdConflictError(Exception):
         super().__init__("audit_id 已绑定不同载荷")
 
 
+class EnvelopeConflictError(Exception):
+    def __init__(self, existing: dict, new_fingerprint: str):
+        self.existing = existing
+        self.new_fingerprint = new_fingerprint
+        super().__init__("envelope_id 已绑定不同来源或扰动系数")
+
+
 def canonical_json(payload: dict) -> bytes:
     return json.dumps(
         payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")
@@ -43,6 +50,56 @@ class AuditStore:
     def _path(self, audit_id: str) -> str:
         safe = hashlib.sha256(audit_id.encode("utf-8")).hexdigest()
         return os.path.join(self.data_dir, f"{safe}.json")
+
+    def _envelope_path(self, envelope_id: str) -> str:
+        safe = hashlib.sha256(("\x00env:" + envelope_id).encode("utf-8")).hexdigest()
+        return os.path.join(self.data_dir, f"env-{safe}.json")
+
+    def get_envelope(self, envelope_id: str) -> dict | None:
+        path = self._envelope_path(envelope_id)
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                return json.load(f)
+        except FileNotFoundError:
+            return None
+
+    def submit_envelope(
+        self, envelope_id: str, payload_canonical: dict, result: dict
+    ) -> tuple[dict, bool]:
+        """冻结包线记录，语义与审计相同：同号同载荷重放，改来源/系数即冲突。
+
+        指纹中的规范载荷含来源审计指纹，故“复用派生标识却改变来源或系数”
+        必然得到不同指纹而被拒绝。
+        """
+        new_fp = fingerprint(payload_canonical)
+        with self._lock:
+            existing = self.get_envelope(envelope_id)
+            if existing is not None:
+                if existing["fingerprint"] != new_fp:
+                    raise EnvelopeConflictError(existing, new_fp)
+                return existing, True
+
+            record = {
+                "envelope_id": envelope_id,
+                "created_at": datetime.now(timezone.utc)
+                .isoformat(timespec="seconds")
+                .replace("+00:00", "Z"),
+                "fingerprint": new_fp,
+                "payload": payload_canonical,
+                "result": result,
+                "method": "fourier-motzkin/exact-rational",
+            }
+            self._write_atomic_envelope(envelope_id, record)
+            return record, False
+
+    def _write_atomic_envelope(self, envelope_id: str, record: dict) -> None:
+        path = self._envelope_path(envelope_id)
+        tmp = path + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(record, f, ensure_ascii=False, indent=2)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, path)
 
     def get(self, audit_id: str) -> dict | None:
         path = self._path(audit_id)
