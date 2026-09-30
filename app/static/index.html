@@ -110,6 +110,64 @@
     <div id="result-meta" class="muted" style="margin-bottom:10px"></div>
     <div id="result-body"></div>
   </section>
+
+  <section id="envelope-panel" class="panel" hidden>
+    <h2>4. 运行包线：功率漂移 p 与场强偏置 q 共同变化</h2>
+    <p class="muted" style="margin:0 0 10px">
+      对每条原约束填两个 <b>整数</b>扰动系数 (u, v)，扰动后约束为
+      a·x ≤ b + u·p + v·q。引擎以任意精度有理数 Fourier–Motzkin 消元
+      <b>一次性消去全部电流变量</b>，精确投影出全部可行扰动对（不抽样、
+      不浮点、不只检查两个扰动轴），并冻结规范整数半平面 α·p + β·q ≤ γ
+      与来源合并式。
+    </p>
+    <div class="scroll">
+      <table>
+        <thead><tr>
+          <th>#</th><th>原约束（a·x ≤ b）</th>
+          <th>u（p 系数）</th><th>v（q 系数）</th>
+        </tr></thead>
+        <tbody id="pert-body"></tbody>
+      </table>
+    </div>
+    <div class="toprow" style="margin-top:12px">
+      <div>
+        <label for="env-id">包线编号 envelope_id</label>
+        <input type="text" id="env-id" placeholder="如 envelope-2026-09-28-A">
+      </div>
+      <div style="flex:0 0 auto">
+        <button id="env-create" type="button">创建 / 重放包线</button>
+        <button class="secondary" id="env-fetch" type="button">按编号取回包线</button>
+      </div>
+    </div>
+    <div id="env-error"></div>
+  </section>
+
+  <section id="env-result-panel" class="panel" hidden>
+    <h2>冻结运行包线 <span id="env-badge"></span></h2>
+    <div id="env-meta" class="muted" style="margin-bottom:10px"></div>
+    <div id="env-body"></div>
+
+    <h3 style="margin:16px 0 6px">包线内有理坐标查询</h3>
+    <div class="row">
+      <div style="width:150px">
+        <label for="q-p">p（功率漂移）</label>
+        <input type="text" class="num" id="q-p" placeholder="如 -1/2">
+      </div>
+      <div style="width:150px">
+        <label for="q-q">q（场强偏置）</label>
+        <input type="text" class="num" id="q-q" placeholder="如 1/3">
+      </div>
+      <div style="flex:0 0 auto">
+        <button id="env-query" type="button">查询 (p, q)</button>
+      </div>
+    </div>
+    <p class="muted" style="margin:6px 0 0;font-size:12px">
+      坐标接受整数或精确有理文本（如 3、-1/2、1.25），按文本原样提交，
+      不经 JS 浮点。等号落在边界上视为可行。
+    </p>
+    <div id="query-error"></div>
+    <div id="query-body" style="margin-top:10px"></div>
+  </section>
 </main>
 
 <script>
@@ -270,6 +328,20 @@ function renderResult(rec, replayed) {
           + ` ＝ 0，右侧 = <span class="num neg">${escapeHtml(r.combined_rhs)}</span> &lt; 0</p>`;
   }
   document.getElementById('result-body').innerHTML = html;
+
+  // 只有可行审计才能作为包线来源；不可行时隐藏并重置包线区
+  lastAuditRecord = rec;
+  if (r.status === 'feasible') {
+    renderPerturbationRows(rec.payload.constraints, rec.payload.variables, null);
+    document.getElementById('env-id').value =
+      (rec.audit_id || '').replace(/[^a-zA-Z0-9.@_-]/g, '_') + '-envelope';
+    envPanel.hidden = false;
+    envResultPanel.hidden = true;
+    lastEnvelopeRecord = null;
+  } else {
+    envPanel.hidden = true;
+    envResultPanel.hidden = true;
+  }
 }
 
 document.getElementById('add-con').addEventListener('click', () => addConRow());
@@ -309,6 +381,231 @@ document.getElementById('fetch').addEventListener('click', async () => {
   if (!resp.ok) { showError(`[${resp.status}] ${data.error || ''}`); return; }
   renderResult(data, true);
 });
+
+// ===================== 运行包线 =====================
+let lastAuditRecord = null;   // 最近渲染的（可行）审计冻结记录
+let lastEnvelopeRecord = null;
+
+const envPanel = document.getElementById('envelope-panel');
+const pertBody = document.getElementById('pert-body');
+const envResultPanel = document.getElementById('env-result-panel');
+
+function constraintText(coeffs, b, names) {
+  const parts = [];
+  coeffs.forEach((a, j) => {
+    if (a === 0) return;
+    const name = escapeHtml(names[j]);
+    if (!parts.length) {
+      parts.push(a === 1 ? name : (a === -1 ? '-' + name : a + '·' + name));
+    } else if (a > 0) {
+      parts.push('+ ' + (a === 1 ? name : a + '·' + name));
+    } else {
+      parts.push('− ' + (a === -1 ? name : (-a) + '·' + name));
+    }
+  });
+  return (parts.length ? parts.join(' ') : '0') + ` ≤ <b>${escapeHtml(String(b))}</b>`;
+}
+
+function renderPerturbationRows(cons, names, preset) {
+  pertBody.innerHTML = '';
+  cons.forEach((con, i) => {
+    const tr = document.createElement('tr');
+    const pu = preset ? preset[i].u : 0;
+    const pv = preset ? preset[i].v : 0;
+    tr.innerHTML =
+      `<td class="num">${i+1}</td>` +
+      `<td class="num">${constraintText(con.coeffs, con.b, names)}` +
+        (con.label ? ` <span class="tag">${escapeHtml(con.label)}</span>` : '') + `</td>` +
+      `<td><input class="pu num" type="text" inputmode="numeric" value="${pu}"></td>` +
+      `<td><input class="pv num" type="text" inputmode="numeric" value="${pv}"></td>`;
+    pertBody.appendChild(tr);
+  });
+}
+
+function showEnvError(msg) {
+  document.getElementById('env-error').innerHTML =
+    msg ? `<div class="err">${escapeHtml(msg)}</div>` : '';
+}
+function showQueryError(msg) {
+  document.getElementById('query-error').innerHTML =
+    msg ? `<div class="err">${escapeHtml(msg)}</div>` : '';
+}
+
+function collectEnvelopePayloadText() {
+  const envId = document.getElementById('env-id').value.trim();
+  if (!envId) throw new Error('请填写包线编号 envelope_id');
+  if (!lastAuditRecord) throw new Error('请先提交或取回一条可行审计');
+  const rows = [...pertBody.rows];
+  const ps = rows.map((tr, i) => {
+    const uv = tr.querySelector('.pu').value.trim() || '0';
+    const vv = tr.querySelector('.pv').value.trim() || '0';
+    const u = intToken(uv, `第 ${i+1} 行扰动系数 u`);
+    const v = intToken(vv, `第 ${i+1} 行扰动系数 v`);
+    return `{"u":${u},"v":${v}}`;
+  });
+  return {
+    text: `{"envelope_id":${JSON.stringify(envId)},` +
+          `"source_audit_id":${JSON.stringify(lastAuditRecord.audit_id)},` +
+          `"perturbations":[${ps.join(',')}]}`,
+    envId,
+  };
+}
+
+function nonzeroMultipliers(mus) {
+  const items = mus.map((m, i) => ({m, i})).filter(x => x.m !== '0');
+  if (!items.length) return '<span class="muted">—</span>';
+  return items.map(x => `λ<span class="num">${x.i+1}</span>=<span class="num">${escapeHtml(x.m)}</span>`).join(' ');
+}
+
+function derivationHtml(d) {
+  let h = '<div class="scroll"><table><thead><tr>' +
+    '<th>#</th><th>乘子 λ</th><th>λ·a（电流系数）</th>' +
+    '<th>λ·(−u) (p)</th><th>λ·(−v) (q)</th><th>λ·b（右端）</th>' +
+    '</tr></thead><tbody>';
+  for (const t of d.terms) {
+    h += `<tr><td class="num">${t.index+1}${t.label ? ' <span class="tag">'+escapeHtml(t.label)+'</span>':''}</td>`
+      + `<td>${frac(t.multiplier)}</td>`
+      + `<td><span class="num">[${t.weighted_coeffs.map(escapeHtml).join(', ')}]</span></td>`
+      + `<td class="num">${escapeHtml(t.weighted_p)}</td>`
+      + `<td class="num">${escapeHtml(t.weighted_q)}</td>`
+      + `<td class="num">${escapeHtml(t.weighted_rhs)}</td></tr>`;
+  }
+  h += '</tbody></table></div>';
+  h += `<p class="muted" style="margin:6px 0">逐项相加：电流系数 = <span class="num">[${d.combined_coeffs.map(escapeHtml).join(', ')}]</span>（必须全 0），`
+     + `合并式 <span class="num">${escapeHtml(d.combined_p)}·p + ${escapeHtml(d.combined_q)}·q ≤ ${escapeHtml(d.combined_rhs)}</span>`
+     + ` ⇒ 规范边界 <b class="num">${escapeHtml(d.normalized_line)}</b></p>`;
+  return h;
+}
+
+function renderEnvelope(rec, replayed) {
+  lastEnvelopeRecord = rec;
+  envResultPanel.hidden = false;
+  const pj = rec.projection;
+  document.getElementById('env-badge').innerHTML =
+    pj.whole_plane
+      ? '<span class="badge ok">全平面可行（无边界）</span>'
+      : `<span class="badge ok">${pj.boundary_count} 条规范半平面</span>`;
+  document.getElementById('env-meta').innerHTML =
+    `包线编号 <b>${escapeHtml(rec.envelope_id)}</b> · 来源审计 ` +
+    `<b>${escapeHtml(rec.source_audit_id)}</b> · ` +
+    `${replayed ? '重放冻结记录' : '首次冻结'} · 创建于 ${escapeHtml(rec.created_at)} · ` +
+    `方法 ${pj.method} · 各消元阶段生成合并式 ` +
+    `<span class="num">[${pj.combinations_per_stage.join(', ')}]</span> · ` +
+    `指纹 <span class="num">${escapeHtml(rec.fingerprint.slice(0,25))}…</span>`;
+
+  let html = '';
+  if (pj.whole_plane) {
+    html += '<p>所有电流自由变量消去后没有产生任何非平凡半平面：'
+          + '<b>任意 (p, q) 都可行</b>（含两个无界方向，未做任何人为封闭）。</p>';
+  } else {
+    html += '<p>下列规范整数半平面的交集即全部可行扰动对；每条边界均可展开来源合并式复算：</p>';
+    html += '<div class="scroll"><table><thead><tr>'
+          + '<th>#</th><th>规范半平面 α·p + β·q ≤ γ</th><th>来源非负乘子</th><th>来源合并式</th>'
+          + '</tr></thead><tbody>';
+    for (const h of pj.halfplanes) {
+      html += `<tr><td class="num">${h.index+1}</td>`
+           + `<td class="num"><b>${escapeHtml(h.line)}</b></td>`
+           + `<td>${nonzeroMultipliers(h.multipliers)}</td>`
+           + `<td><details><summary class="muted">展开逐项合并</summary>${derivationHtml(h.derivation)}</details></td></tr>`;
+    }
+    html += '</tbody></table></div>';
+  }
+  document.getElementById('env-body').innerHTML = html;
+  document.getElementById('env-id').value = rec.envelope_id;
+  document.getElementById('query-body').innerHTML = '';
+  showQueryError('');
+}
+
+async function submitEnvelope() {
+  showEnvError('');
+  let collected;
+  try { collected = collectEnvelopePayloadText(); }
+  catch (e) { showEnvError(e.message); return; }
+  try {
+    const resp = await fetch('/api/envelopes', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: collected.text,
+    });
+    const data = await resp.json();
+    if (!resp.ok) {
+      showEnvError(`[${resp.status}] ${data.error}\n${data.detail || ''}`
+        + (data.existing_fingerprint ? `\n既有指纹: ${data.existing_fingerprint}\n新指纹: ${data.new_fingerprint}` : ''));
+      return;
+    }
+    renderEnvelope(data, data.replayed);
+  } catch (e) { showEnvError('网络错误: ' + e.message); }
+}
+document.getElementById('env-create').addEventListener('click', submitEnvelope);
+
+document.getElementById('env-fetch').addEventListener('click', async () => {
+  showEnvError('');
+  const id = document.getElementById('env-id').value.trim();
+  if (!id) { showEnvError('请填写包线编号 envelope_id'); return; }
+  const resp = await fetch('/api/envelopes/' + encodeURIComponent(id));
+  const data = await resp.json();
+  if (!resp.ok) { showEnvError(`[${resp.status}] ${data.error || ''}`); return; }
+  // 用冻结记录里的来源重建扰动表与来源上下文
+  const names = data.variables;
+  lastAuditRecord = {
+    audit_id: data.source_audit_id,
+    payload: {variables: names, constraints: data.sources.map(s => ({coeffs: s.coeffs, b: s.b, label: s.label}))},
+  };
+  renderPerturbationRows(
+    data.sources.map(s => ({coeffs: s.coeffs, b: s.b, label: s.label})),
+    names, data.sources.map(s => ({u: s.u, v: s.v})));
+  envPanel.hidden = false;
+  renderEnvelope(data, true);
+});
+
+document.getElementById('env-query').addEventListener('click', async () => {
+  showQueryError('');
+  if (!lastEnvelopeRecord) { showQueryError('请先创建或取回一个包线'); return; }
+  const pText = document.getElementById('q-p').value.trim();
+  const qText = document.getElementById('q-q').value.trim();
+  if (!pText || !qText) { showQueryError('请填写 p 与 q（整数或 p/q 文本）'); return; }
+  // 坐标以文本提交，绝不经过 Number()
+  const body = JSON.stringify({p: pText, q: qText});
+  try {
+    const resp = await fetch(
+      '/api/envelopes/' + encodeURIComponent(lastEnvelopeRecord.envelope_id) + '/query',
+      {method: 'POST', headers: {'Content-Type': 'application/json'}, body});
+    const data = await resp.json();
+    if (!resp.ok) { showQueryError(`[${resp.status}] ${data.error || ''}\n${data.detail || ''}`); return; }
+    renderQueryAnswer(data);
+  } catch (e) { showQueryError('网络错误: ' + e.message); }
+});
+
+function renderQueryAnswer(a) {
+  let html = '';
+  const head = `坐标 <span class="num">(p, q) = (${escapeHtml(a.p)}, ${escapeHtml(a.q)})</span>：`;
+  if (a.feasible) {
+    html += `<p>${head}<span class="badge ok">可行</span></p>`;
+    html += '<p>一组可复算的有理电流（Phase-I 单纯形给出，回代每条原约束均满足）：</p>';
+    html += '<div class="scroll"><table><thead><tr><th>电流</th><th>值</th></tr></thead><tbody>';
+    for (const [k, v] of Object.entries(a.currents)) {
+      html += `<tr><td>${escapeHtml(k)}</td><td>${frac(v)}</td></tr>`;
+    }
+    html += '</tbody></table></div>';
+    html += '<p style="margin-top:10px">扰动后右端 b+u·p+v·q 与精确余量：</p>';
+    html += '<div class="scroll"><table><thead><tr><th>#</th><th>扰动后右端</th><th>余量（≥0）</th></tr></thead><tbody>';
+    for (const m of a.margins) {
+      html += `<tr><td class="num">${m.index+1}${m.label ? ' <span class="tag">'+escapeHtml(m.label)+'</span>':''}</td>`
+           + `<td class="num">${escapeHtml(m.rhs)}</td><td>${frac(m.residual)}</td></tr>`;
+    }
+    html += '</tbody></table></div>';
+  } else {
+    const v = a.violation;
+    html += `<p>${head}<span class="badge bad">包线外</span></p>`;
+    html += '<p>按冻结规范顺序，首条被严格违反的边界：'
+          + `<b class="num">#${v.index+1}　${escapeHtml(v.line)}</b></p>`;
+    html += `<p>代入结果 α·p + β·q = <b class="num">${escapeHtml(v.substitution)}</b>`
+          + `　&gt;　γ = <b class="num">${escapeHtml(String(v.gamma))}</b>；`
+          + `严格违反值 = <b class="num neg">${escapeHtml(v.strict_excess)}</b> &gt; 0</p>`;
+    html += `<details><summary class="muted">该违约边界的来源合并式证据</summary>${derivationHtml(v.derivation)}</details>`;
+  }
+  document.getElementById('query-body').innerHTML = html;
+}
 
 // 初始化
 renderVars();
